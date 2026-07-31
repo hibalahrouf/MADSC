@@ -81,10 +81,8 @@ $argLine = "-NoProfile -ExecutionPolicy Bypass -File `"$CollectorPath`" -OutDir 
 if ($PostUrl) { $argLine += " -PostUrl `"$PostUrl`"" }   # envoi direct a MADSC (sans partage)
 $action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argLine
 
-# Déclencheur : première exécution dans 2 min, puis répétition toutes les N heures, indéfiniment
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2)
-$trigger.Repetition.Interval = "PT${IntervalHours}H"
-$trigger.Repetition.Duration = ""     # vide = indéfiniment
+# Declencheur : premiere execution dans 2 min, puis repetition toutes les N heures, indefiniment
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Hours $IntervalHours)
 
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
