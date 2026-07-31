@@ -3,12 +3,17 @@
     Collecteur MADSC — composition des groupes privilégiés (LECTURE SEULE, sur le DC).
 
 .DESCRIPTION
-    Lit les membres EFFECTIFS (récursifs) des groupes privilégiés Tier 0 et produit un snapshot JSON.
-    Résolution par SID/RID (indépendant de la localisation FR/EN). Toute modification de composition
-    ressort en DÉRIVE (CHANGED) côté MADSC — ces contrôles sont « baseline-only » (pas de valeur fixe).
+    Lit les membres EFFECTIFS (récursifs) des groupes privilégiés Tier 0 via LDAP direct (ADSI).
+    Résolution par SID/RID (indépendant de la localisation FR/EN).
 
-    GARANTIE : 100 % LECTURE (Get-ADGroupMember / Get-ADDomain). Aucun écrit AD.
-    Requiert le module ActiveDirectory (présent sur un DC ou via RSAT).
+    ┌─ POURQUOI ADSI/LDAP et PAS le module ActiveDirectory ─────────────────────────────┐
+    │ Le module ActiveDirectory (Get-AD*) dépend du service ADWS (port 9389). Si ADWS    │
+    │ est arrêté, tous les Get-AD* échouent. ADSI interroge le DC en LDAP (389), qui est  │
+    │ indépendant d'ADWS -> ce collecteur fonctionne même sans ADWS et SANS aucun module. │
+    └────────────────────────────────────────────────────────────────────────────────────┘
+
+    GARANTIE : 100 % LECTURE (RootDSE + DirectorySearcher). Aucun écrit AD.
+    Membres récursifs via la règle LDAP IN_CHAIN (1.2.840.113556.1.4.1941).
 
 .PARAMETER OutDir   Dossier de sortie du snapshot JSON (défaut : dossier courant).
 .PARAMETER PostUrl  URL MADSC pour envoi HTTP direct (ex. http://192.168.10.1:8700/ingest).
@@ -22,40 +27,75 @@ param(
     [string]$PostUrl
 )
 
-Import-Module ActiveDirectory -ErrorAction Stop
+# Contextes de nommage via RootDSE (LDAP, ne dépend PAS d'ADWS)
+$rootDSE      = [ADSI]"LDAP://RootDSE"
+$domainDN     = [string]$rootDSE.defaultNamingContext
+$rootDomainDN = [string]$rootDSE.rootDomainNamingContext
+
+# SID du domaine (pour construire les RID) et du domaine racine de forêt
+function ConvertTo-SidString($obj) {
+    $bytes = $obj.Properties["objectSid"][0]
+    return (New-Object System.Security.Principal.SecurityIdentifier($bytes, 0)).Value
+}
+$domainSid = ConvertTo-SidString ([ADSI]"LDAP://$domainDN")
+try { $rootSid = ConvertTo-SidString ([ADSI]"LDAP://$rootDomainDN") } catch { $rootSid = $domainSid }
 
 $pt   = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).ProductType
 $role = switch ($pt) { 2 { 'DC' } 3 { 'MEMBER' } default { 'WORKSTATION' } }
 
-$domainSid = (Get-ADDomain).DomainSID.Value
-try { $rootSid = (Get-ADDomain (Get-ADForest).RootDomain).DomainSID.Value } catch { $rootSid = $domainSid }
+function Get-GroupDN {
+    param([string]$Sid, [string]$Name)
+    if ($Sid) {
+        try {
+            $g  = [ADSI]"LDAP://<SID=$Sid>"
+            $dn = [string]$g.Properties["distinguishedName"][0]
+            if ($dn) { return $dn }
+        } catch {}
+        return $null
+    }
+    $s = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$domainDN")
+    $s.Filter = "(&(objectClass=group)(sAMAccountName=$Name))"
+    [void]$s.PropertiesToLoad.Add("distinguishedName")
+    $r = $s.FindOne()
+    if ($r) { return [string]$r.Properties["distinguishedname"][0] }
+    return $null
+}
 
-# Membres effectifs (récursifs) d'un groupe -> chaîne triée "a, b, c" (comparaison de dérive fiable)
-function Get-GroupControl {
-    param($ControlId, $Identity)
-    try {
-        $names = Get-ADGroupMember -Identity $Identity -Recursive -ErrorAction Stop |
-                 Select-Object -ExpandProperty SamAccountName
-    } catch { return $null }
-    $sorted = @($names | Sort-Object)
+# Membres effectifs (récursifs) via IN_CHAIN -> comptes personnes uniquement
+function Get-EffectiveMembers {
+    param([string]$GroupDN)
+    $s = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$domainDN")
+    $s.PageSize = 1000
+    $s.Filter   = "(&(objectCategory=person)(objectClass=user)(memberOf:1.2.840.113556.1.4.1941:=$GroupDN))"
+    [void]$s.PropertiesToLoad.Add("sAMAccountName")
+    $names = @()
+    foreach ($r in $s.FindAll()) { $names += [string]$r.Properties["samaccountname"][0] }
+    return @($names | Sort-Object -Unique)
+}
+
+function New-GroupControl {
+    param([string]$ControlId, [string]$Sid, [string]$Name)
+    $dn = Get-GroupDN -Sid $Sid -Name $Name
+    if (-not $dn) { return $null }
+    $members = @(Get-EffectiveMembers -GroupDN $dn)
     return [pscustomobject]@{
         control_id = $ControlId
-        observed   = @{ members = ($sorted -join ', '); count = $sorted.Count }
-        raw        = "Get-ADGroupMember -Recursive $Identity"
+        observed   = @{ members = ($members -join ', '); count = $members.Count }
+        raw        = "LDAP IN_CHAIN memberOf ($dn)"
     }
 }
 
 $targets = @(
-    @{ cid = 'PRIV-DOMAIN-ADMINS';     id = "$domainSid-512" },
-    @{ cid = 'PRIV-ENTERPRISE-ADMINS'; id = "$rootSid-519" },
-    @{ cid = 'PRIV-SCHEMA-ADMINS';     id = "$rootSid-518" },
-    @{ cid = 'PRIV-BUILTIN-ADMINS';    id = 'S-1-5-32-544' },
-    @{ cid = 'PRIV-GG-T0-ADMINS';      id = 'GG_T0_Admins' }
+    @{ cid = 'PRIV-DOMAIN-ADMINS';     sid = "$domainSid-512"; name = $null },
+    @{ cid = 'PRIV-ENTERPRISE-ADMINS'; sid = "$rootSid-519";   name = $null },
+    @{ cid = 'PRIV-SCHEMA-ADMINS';     sid = "$rootSid-518";   name = $null },
+    @{ cid = 'PRIV-BUILTIN-ADMINS';    sid = 'S-1-5-32-544';   name = $null },
+    @{ cid = 'PRIV-GG-T0-ADMINS';      sid = $null;            name = 'GG_T0_Admins' }
 )
 
 $controls = @()
 foreach ($t in $targets) {
-    $c = Get-GroupControl -ControlId $t.cid -Identity $t.id
+    $c = New-GroupControl -ControlId $t.cid -Sid $t.sid -Name $t.name
     if ($c) { $controls += $c }
     else    { Write-Host "[MADSC] $($t.cid) : groupe introuvable/erreur, ignore" -ForegroundColor Yellow }
 }
@@ -64,7 +104,7 @@ $snapshot = [pscustomobject]@{
     host              = $env:COMPUTERNAME
     role              = $role
     collector         = 'Collect-PrivilegedGroups'
-    collector_version = '1.0'
+    collector_version = '1.1'
     collected_at      = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     controls          = $controls
 }
