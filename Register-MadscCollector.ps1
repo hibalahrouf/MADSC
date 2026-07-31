@@ -43,13 +43,21 @@
 param(
     [string]$OutDir = "C:\MADSC-out",
     [int]$IntervalHours = 12,
-    [string]$CollectorPath = (Join-Path $PSScriptRoot 'Collect-Protocols.ps1'),
+    [string]$CollectorPath = "",
     [string]$TaskName = "MADSC-Collect-Protocols",
     [string]$PostUrl,   # ex. http://192.168.10.1:8700/ingest -> envoi direct a MADSC (sans partage)
     [switch]$Remove
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not $CollectorPath) {
+    if ($PSScriptRoot) {
+        $CollectorPath = Join-Path $PSScriptRoot 'Collect-Protocols.ps1'
+    } else {
+        $CollectorPath = '.\Collect-Protocols.ps1'
+    }
+}
 
 # Élévation requise (Register/Unregister-ScheduledTask)
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
