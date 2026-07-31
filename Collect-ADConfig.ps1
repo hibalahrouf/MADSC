@@ -64,24 +64,28 @@ if ($role -eq 'DC') {
 
 # 3. Corbeille AD (DC uniquement)
 if ($role -eq 'DC') {
+    $isEnabled = $false
     try {
-        $rootDse  = [ADSI]"LDAP://RootDSE"
-        $configDN = $rootDse.configurationNamingContext
-        $recycleBinDN = "CN=Recycle Bin Feature,CN=Optional Features,CN=Directory Service,CN=Services,$configDN"
-        
-        $recycleBinObj = [ADSI]"LDAP://$recycleBinDN"
-        $isEnabled = $false
-        if ($recycleBinObj -and $recycleBinObj.Properties['msDS-OptionalFeatureFlags']) {
-            $isEnabled = $true
-        }
-
-        $controls += [pscustomobject]@{
-            control_id = 'AD-RECYCLE-BIN'
-            observed   = @{ RecycleBinEnabled = [bool]$isEnabled }
-            raw        = "ADSI: LDAP://$recycleBinDN"
-        }
+        $feat = Get-ADOptionalFeature -Identity 'Recycle Bin Feature' -ErrorAction Stop
+        $isEnabled = ($feat.EnabledScopes.Count -gt 0)
     } catch {
-        Write-Host "[MADSC] AD-RECYCLE-BIN : erreur d'evaluation ADSI" -ForegroundColor Yellow
+        try {
+            $rootDse = [ADSI]"LDAP://RootDSE"
+            $configDN = $rootDse.configurationNamingContext
+            $partObj = [ADSI]"LDAP://CN=Partitions,$configDN"
+            $enabledFeats = $partObj.Properties['msDS-EnabledFeature']
+            if ($enabledFeats) {
+                foreach ($f in $enabledFeats) {
+                    if ($f -like '*Recycle Bin*') { $isEnabled = $true; break }
+                }
+            }
+        } catch { $isEnabled = $false }
+    }
+
+    $controls += [pscustomobject]@{
+        control_id = 'AD-RECYCLE-BIN'
+        observed   = @{ RecycleBinEnabled = [bool]$isEnabled }
+        raw        = 'Get-ADOptionalFeature / ADSI Partitions'
     }
 }
 
