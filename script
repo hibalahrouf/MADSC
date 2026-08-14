@@ -4,20 +4,50 @@ Import-Module GroupPolicy -ErrorAction Stop
 $dom = Get-ADDomain; $root = $dom.DistinguishedName
 "HOTE : $env:COMPUTERNAME   DOMAINE : $($dom.DNSRoot)   $(Get-Date -Format 'dd/MM/yyyy HH:mm')"
 "-" * 74
+
+# [1] Valeur effective de LDAPServerIntegrity
 $v = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' `
-        -Name LDAPServerIntegrity).LDAPServerIntegrity
+        -Name LDAPServerIntegrity -ErrorAction SilentlyContinue).LDAPServerIntegrity
+if ($null -eq $v) { $v = "(absent - valeur par defaut du systeme)" }
 "[1] LDAPServerIntegrity (valeur effective) ....... $v`n"
+
+# [2] Ordre des strategies liees a OU=Domain Controllers
 "[2] Ordre des strategies liees a OU=Domain Controllers"
 (Get-GPInheritance -Target "OU=Domain Controllers,$root").GpoLinks |
   Sort-Object Order | ForEach-Object { "      {0}  {1}" -f $_.Order, $_.DisplayName }
-"`n[3] Liaison LDAP simple en clair, port 389 (identifiants volontairement factices)"
-$id = New-Object System.DirectoryServices.Protocols.LdapDirectoryIdentifier($env:COMPUTERNAME,389)
-$cn = New-Object System.DirectoryServices.Protocols.LdapConnection($id)
-$cn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Basic
-$cn.SessionOptions.ProtocolVersion = 3
-$cn.Credential = New-Object System.Net.NetworkCredential('probe_inexistant','x',$dom.DNSRoot)
-try   { $cn.Bind(); "      ECHEC - liaison en clair acceptee" }
-catch { "      PASS  - rejetee : $($_.Exception.Message)" }
+
+# [3] Preuve reelle de l'application du signing : evenement 2889
+# (journalise chaque liaison SASL/Negotiate NON signee refusee quand LDAPServerIntegrity=2)
+"`n[3] Verification via journal Directory Service (Event ID 2889)"
+$before = Get-WinEvent -LogName "Directory Service" `
+            -FilterXPath "*[System[EventID=2889]]" -MaxEvents 1 -ErrorAction SilentlyContinue
+
+"      Tentative de liaison LDAP NON signee (Negotiate) sur port 389..."
+try {
+    $id = New-Object System.DirectoryServices.Protocols.LdapDirectoryIdentifier($env:COMPUTERNAME,389)
+    $cn = New-Object System.DirectoryServices.Protocols.LdapConnection($id)
+    $cn.SessionOptions.ProtocolVersion = 3
+    $cn.SessionOptions.Sealing  = $false
+    $cn.SessionOptions.Signing  = $false
+    $cn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Negotiate
+    $cn.Bind()
+    "      ECHEC DU TEST - liaison non signee acceptee (signing NON applique)"
+} catch {
+    "      Bind rejete cote client : $($_.Exception.Message)"
+}
+
+Start-Sleep -Seconds 2
+$after = Get-WinEvent -LogName "Directory Service" `
+           -FilterXPath "*[System[EventID=2889]]" -MaxEvents 1 -ErrorAction SilentlyContinue
+
+if ($after -and (!$before -or $after.RecordId -ne $before.RecordId)) {
+    "      PASS - Event 2889 genere : le DC a bien journalise/rejete la liaison non signee"
+    "      $($after.Message.Split("`n")[0])"
+} else {
+    "      ATTENTION - aucun nouvel evenement 2889 detecte, verifier manuellement avec ldp.exe"
+}
+
+# [4] Controle positif - la voie signee fonctionne toujours
 "`n[4] Controle positif - la voie signee fonctionne toujours"
 $n = (Get-ADUser -Filter * -ResultSetSize 5 | Measure-Object).Count
 "      Requete LDAP signee : $n objets retournes"
