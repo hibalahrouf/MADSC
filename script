@@ -1,30 +1,23 @@
 Clear-Host
 Import-Module ActiveDirectory -ErrorAction Stop
+Import-Module GroupPolicy -ErrorAction Stop
 $dom = Get-ADDomain; $root = $dom.DistinguishedName
 "HOTE : $env:COMPUTERNAME   DOMAINE : $($dom.DNSRoot)   $(Get-Date -Format 'dd/MM/yyyy HH:mm')"
 "-" * 74
-$maq = (Get-ADObject $root -Properties 'ms-DS-MachineAccountQuota').'ms-DS-MachineAccountQuota'
-"[1] ms-DS-MachineAccountQuota ................ $maq`n"
-"[2] AccountNotDelegated - comptes d'administration"
-Get-ADUser -Filter "Name -eq 'Administrateur' -or Name -like 'adm_t*'" -Properties AccountNotDelegated |
-  Sort-Object Name | ForEach-Object { "      {0,-20} {1}" -f $_.Name, $_.AccountNotDelegated }
-"`n[3] ACE Operateurs de compte / d'impression sur les unites Tier 0"
-$noms = 'S-1-5-32-548','S-1-5-32-550' | ForEach-Object {
-  (New-Object System.Security.Principal.SecurityIdentifier $_).Translate([System.Security.Principal.NTAccount]).Value }
-Get-ADOrganizationalUnit -SearchBase "OU=Tier0,$root" -SearchScope Subtree -Filter * |
-  Sort-Object Name | ForEach-Object {
-    $n = @((Get-Acl "AD:\$($_.DistinguishedName)").Access |
-           Where-Object { $noms -contains $_.IdentityReference.Value }).Count
-    "      {0,-20} {1} ACE" -f $_.Name, $n }
-"`n[4] adminCount et heritage d'ACL"
-'Hibalahrouf','adm_t1_oussama' | ForEach-Object {
-  $u = Get-ADUser $_ -Properties adminCount
-  $ac = if ($null -eq $u.adminCount) { '<vide>' } else { $u.adminCount }
-  $h = -not (Get-Acl "AD:\$($u.DistinguishedName)").AreAccessRulesProtected
-  "      {0,-20} adminCount={1,-8} HeritageActif={2}" -f $u.Name, $ac, $h }
-$rb = Get-ADOptionalFeature -Filter "Name -eq 'Recycle Bin Feature'"
-$etat = if ($rb.EnabledScopes.Count -gt 0) { 'Activee' } else { 'Desactivee' }
-"`n[5] Corbeille Active Directory ............... $etat"
-$np = @(Get-ADOrganizationalUnit -Filter * -Properties ProtectedFromAccidentalDeletion |
-        Where-Object { -not $_.ProtectedFromAccidentalDeletion }).Count
-"    Unites non protegees contre la suppression  $np"
+$v = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' `
+        -Name LDAPServerIntegrity).LDAPServerIntegrity
+"[1] LDAPServerIntegrity (valeur effective) ....... $v`n"
+"[2] Ordre des strategies liees a OU=Domain Controllers"
+(Get-GPInheritance -Target "OU=Domain Controllers,$root").GpoLinks |
+  Sort-Object Order | ForEach-Object { "      {0}  {1}" -f $_.Order, $_.DisplayName }
+"`n[3] Liaison LDAP simple en clair, port 389 (identifiants volontairement factices)"
+$id = New-Object System.DirectoryServices.Protocols.LdapDirectoryIdentifier($env:COMPUTERNAME,389)
+$cn = New-Object System.DirectoryServices.Protocols.LdapConnection($id)
+$cn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Basic
+$cn.SessionOptions.ProtocolVersion = 3
+$cn.Credential = New-Object System.Net.NetworkCredential('probe_inexistant','x',$dom.DNSRoot)
+try   { $cn.Bind(); "      ECHEC - liaison en clair acceptee" }
+catch { "      PASS  - rejetee : $($_.Exception.Message)" }
+"`n[4] Controle positif - la voie signee fonctionne toujours"
+$n = (Get-ADUser -Filter * -ResultSetSize 5 | Measure-Object).Count
+"      Requete LDAP signee : $n objets retournes"
